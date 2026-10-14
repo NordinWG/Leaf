@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NordinWG <115358788+NordinWG@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 17:30:09 +0200
+Subject: [PATCH] Fix ghost blocks, packet mining and eating while placing
+
+
+diff --git a/net/minecraft/server/level/ServerPlayerGameMode.java b/net/minecraft/server/level/ServerPlayerGameMode.java
+index e9c58fc9bb16f8605410fe85971a7d4b1c3d3915..9a42ea2cabd02007854caaff6eed89cfbe3ab6c7 100644
+--- a/net/minecraft/server/level/ServerPlayerGameMode.java
++++ b/net/minecraft/server/level/ServerPlayerGameMode.java
+@@ -177,8 +177,11 @@ public class ServerPlayerGameMode {
+ 
+     public void handleBlockBreakAction(BlockPos pos, ServerboundPlayerActionPacket.Action action, Direction face, int maxBuildHeight, int sequence) {
+         if (!this.player.isWithinBlockInteractionRange(pos, 1.0)) {
+-            if (true) return; // Paper - Don't allow digging into unloaded chunks; Don't notify if unreasonably far away
++            // Leaf start - fix ghost blocks: resync the client instead of silently dropping the action
++            this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
+             this.debugLogging(pos, false, sequence, "too far");
++            return;
++            // Leaf end - fix ghost blocks
+         } else if (pos.getY() > maxBuildHeight) {
+             this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
+             this.debugLogging(pos, false, sequence, "too high");
+@@ -290,6 +293,10 @@ public class ServerPlayerGameMode {
+                             this.delayedTickStart = this.destroyProgressStart;
+                         }
+                     }
++                } else {
++                    // Leaf start - fix ghost blocks: client sent STOP for a block the server isn't tracking; correct client prediction
++                    this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
++                    // Leaf end - fix ghost blocks
+                 }
+ 
+                 this.debugLogging(pos, true, sequence, "stopped destroying");
+@@ -360,6 +367,9 @@ public class ServerPlayerGameMode {
+                     return false;
+                 }
+ 
++                // Leaf start - fix ghost blocks: immediately resync block state so the client doesn't see a break that the server denied
++                this.player.connection.send(new ClientboundBlockUpdatePacket(pos, this.level.getBlockState(pos)));
++                // Leaf end - fix ghost blocks
+                 // Block entity data is not reset by the block acks, send after destroy prediction
+                 if (!this.captureSentBlockEntities) {
+                     BlockEntity blockEntity = this.level.getBlockEntity(pos);
+diff --git a/net/minecraft/server/network/ServerGamePacketListenerImpl.java b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+index 2a107ee7ad68a2098306ed12c4e5b774d825adfd..c308bb92935a1c4e272b5e84140da6e20d5617ca 100644
+--- a/net/minecraft/server/network/ServerGamePacketListenerImpl.java
++++ b/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+@@ -2032,8 +2032,6 @@ public class ServerGamePacketListenerImpl
+                         } else {
+                             this.player.setItemInHand(InteractionHand.MAIN_HAND, CraftItemStack.asNMSCopy(swapItemsEvent.getMainHandItem()));
+                         }
+-                        // CraftBukkit end
+-                        this.player.stopUsingItem();
+                         if (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.updateEquipmentOnPlayerActions) this.player.detectEquipmentUpdates(); // Paper - Force update attributes.
+                     }
+ 
+@@ -2076,6 +2074,11 @@ public class ServerGamePacketListenerImpl
+                 case STOP_DESTROY_BLOCK:
+                     // Paper start - Don't allow digging into unloaded chunks
+                     if (this.player.level().getChunkIfLoadedImmediately(pos.getX() >> 4, pos.getZ() >> 4) == null || !this.player.isWithinBlockInteractionRange(pos, 1.0)) {
++                        // Leaf start - fix ghost blocks: don't let the client treat a bare ack as "prediction confirmed"
++                        if (this.player.level().getChunkIfLoadedImmediately(pos.getX() >> 4, pos.getZ() >> 4) != null) {
++                            this.send(new ClientboundBlockUpdatePacket(pos, this.player.level().getBlockState(pos)));
++                        }
++                        // Leaf end - fix ghost blocks
+                         this.player.connection.ackBlockChangesUpTo(packet.getSequence());
+                         return;
+                     }
+@@ -2178,7 +2181,6 @@ public class ServerGamePacketListenerImpl
+                         int maxY = this.player.level().getMaxY();
+                         if (blockPos.getY() <= maxY) {
+                             if (this.awaitingPositionFromClient == null && (serverLevel.mayInteract(this.player, blockPos) || (serverLevel.paperConfig().spawn.allowUsingSignsInsideSpawnProtection && serverLevel.getBlockState(blockPos).getBlock() instanceof net.minecraft.world.level.block.SignBlock))) { // Paper - Allow using signs inside spawn protection
+-                                this.player.stopUsingItem(); // CraftBukkit - SPIGOT-4706
+                                 InteractionResult interactionResult = this.player.gameMode.useItemOn(this.player, serverLevel, itemInHand, hand, hitResult);
+                                 if (interactionResult.consumesAction()) {
+                                     CriteriaTriggers.ANY_BLOCK_USE.trigger(this.player, hitResult.getBlockPos(), itemInHand.copy());
+@@ -2213,7 +2215,17 @@ public class ServerGamePacketListenerImpl
+                         this.send(new ClientboundBlockUpdatePacket(serverLevel, blockPos.relative(direction)));
+                         if (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.updateEquipmentOnPlayerActions) this.player.detectEquipmentUpdates(); // Paper - Force update attributes.
+                         // Paper - Remove unused warning
++                    } else {
++                        // Leaf start - fix ghost blocks: client predicted block placement but server rejected at UseItemOn distance check
++                        this.send(new ClientboundBlockUpdatePacket(serverLevel, blockPos));
++                        this.send(new ClientboundBlockUpdatePacket(serverLevel, blockPos.relative(hitResult.getDirection())));
++                        // Leaf end - fix ghost blocks
+                     }
++                } else {
++                    // Leaf start - fix ghost blocks: client predicted block placement but player is out of interaction range
++                    this.send(new ClientboundBlockUpdatePacket(serverLevel, blockPos));
++                    this.send(new ClientboundBlockUpdatePacket(serverLevel, blockPos.relative(hitResult.getDirection())));
++                    // Leaf end - fix ghost blocks
+                 }
+             }
+         }
+@@ -2374,11 +2386,6 @@ public class ServerGamePacketListenerImpl
+                 this.player.resetLastActionTime();
+                 return;
+             }
+-            // CraftBukkit end
+-            if (this.player.getInventory().getSelectedSlot() != packet.getSlot() && this.player.getUsedItemHand() == InteractionHand.MAIN_HAND) {
+-                this.player.stopUsingItem();
+-            }
+-
+             this.player.getInventory().setSelectedSlot(packet.getSlot());
+             this.player.resetLastActionTime();
+             if (io.papermc.paper.configuration.GlobalConfiguration.get().unsupportedSettings.updateEquipmentOnPlayerActions) this.player.detectEquipmentUpdates(); // Paper - Force update attributes.
